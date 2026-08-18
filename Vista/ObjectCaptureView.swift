@@ -2,41 +2,40 @@
 //  ObjectCaptureView.swift
 //  Vista
 //
-//  Object Capture v2 (2026-06-10) — depth + gravity + masks photogrammetry.
+//  Object Capture v3 (2026-08-18) — LARGE-OBJECT (vehicle) capture.
 //
-//  WHAT CHANGED vs v1:
-//  - The green bounding box is GONE. It was never wired into the pipeline —
-//    PhotogrammetrySession only ever received the photo folder — so the box,
-//    its gestures, and ~400 lines of placement code were pure ceremony.
-//    Capture is now: aim, Start, orbit.
-//  - Reconstruction input upgraded from a bare JPEG folder to the iOS 17+
-//    sequence-of-samples API. Each PhotogrammetrySample carries:
-//      depthDataMap  — LiDAR depth at capture time (real-world scale,
-//                      geometry assist)
-//      gravity       — upright orientation
-//      objectMask    — Vision foreground-instance mask = AUTOMATIC object
-//                      isolation; the background never enters the model.
-//    (depthConfidenceMap is get-only on iOS; confidence sidecars are still
-//    saved at capture time for future cloud-side use.)
-//    Samples are built LAZILY, one at a time, so 12 MP buffers never pile up
-//    in memory. Every enrichment is optional per frame — a sample degrades
-//    gracefully to image-only (v1 behavior) if depth/mask/gravity is missing.
-//  - Detail: iOS exposes only .preview/.reduced; we use .reduced. The
-//    fallback chain stays in place for when Apple opens up .medium.
+//  WHAT CHANGED vs v2:
+//  [T2-1] SECTOR BUDGET. v2 had a hard `maxPhotos = 250` with a 9 cm / 6 deg
+//         cadence. Those numbers were tuned for a small object at ~0.5 m:
+//         one orbit is ~3 m of walking -> ~35 photos -> 4 orbits fits in 250.
+//         Around a CAR at ~2 m standoff one orbit is ~20 m of walking, so the
+//         9 cm gate alone spends ~220 photos on the FIRST orbit and the cap
+//         silently kills capture partway round. The far side never gets
+//         photographed, so it never reconstructs. Fix: the bearing angle
+//         around the object is divided into 24 sectors of 15 deg and each
+//         sector gets its own quota. The budget can no longer be eaten by
+//         wherever you started. Standing still stops consuming frames.
+//  [T2-2] OBJECT CENTER from LiDAR at Start (median central depth along the
+//         camera forward ray) -> bearing = atan2 around that point. If depth
+//         is unavailable the old pure translation/rotation cadence is used
+//         unchanged, so behaviour degrades to v2 rather than breaking.
+//  [T2-3] CAPTURE SCALE picker: .small (v2 numbers, 250 cap) or
+//         .vehicle (500 cap, 12 cm / 6 deg cadence, sector budget on).
+//  [T2-4] Vision foreground masking is DISABLED in .vehicle mode. A
+//         VNGenerateForegroundInstanceMaskRequest on a frame where a 4.5 m
+//         car overflows the frame returns an instance that is a PART of the
+//         car (a wheel, a seat) — feeding that as objectMask deletes the rest
+//         of the panel from that view. Small objects keep the mask.
+//         The choice is written to capture_config.json in the frames folder
+//         so ObjectSampleLoader honours it without extra plumbing.
+//  [T2-5] Coverage HUD is bearing-based, not frame-count-based: it reports
+//         how much of the 360 you have actually walked, and says so out loud
+//         when the budget is spent instead of going quiet.
 //
-//  Day 9.5 — ARSession.captureHighResolutionFrame for source images (kept).
-//
-//  Tier 1 detail pass (2026-06-10): more sharp pixels into .reduced —
-//  [T1-1] photo budget 60 -> 120 target / 150 -> 250 max, cadence tightened
-//         (~6 deg / 9 cm) + a FOURTH close-up orbit in the guidance
-//         (pixels-on-target is what becomes texture detail);
-//  [T1-2] recommendedVideoFormatForHighResolutionFrameCapturing is now set —
-//         without it captureHighResolutionFrame can serve plain video res
-//         on some devices (12 MP is ARKit's ceiling; 48 MP isn't reachable
-//         inside an ARKit session);
-//  [T1-3] blur gate: per-photo Laplacian sharpness on a 256px thumb,
-//         self-calibrating threshold (30% of running best) — motion-blurred
-//         frames are rejected and recaptured instead of fed to the model.
+//  Unchanged from v2: 12 MP captureHighResolutionFrame + recommended hi-res
+//  format, per-frame depth/conf/gravity sidecars, Laplacian blur gate at 30%
+//  of running best, iOS 17 sequence-of-samples PhotogrammetrySession,
+//  detail .reduced (iOS ceiling; .full is macOS-only).
 //
 
 import SwiftUI
@@ -48,13 +47,93 @@ import simd
 import UIKit
 import CoreImage
 
+// MARK: - Capture scale
+
+enum CaptureScale: String, Codable, CaseIterable, Identifiable {
+    case small      // mug, tool, part — v2 behaviour
+    case vehicle    // car, trailer, RV, anything you walk around
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .small:   return "Small object"
+        case .vehicle: return "Vehicle / large"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .small:   return "Fits on a table. Orbit at arm's length."
+        case .vehicle: return "Car, trailer, RV. You walk around it."
+        }
+    }
+
+    var maxPhotos: Int {
+        switch self {
+        case .small:   return 250
+        case .vehicle: return 500
+        }
+    }
+
+    var translationThresholdMeters: Float {
+        switch self {
+        case .small:   return 0.09
+        case .vehicle: return 0.12
+        }
+    }
+
+    var rotationThresholdRadians: Float { 0.10 }
+
+    /// Sector budget only makes sense once the object is big enough that you
+    /// orbit it on foot.
+    var usesSectorBudget: Bool {
+        switch self {
+        case .small:   return false
+        case .vehicle: return true
+        }
+    }
+
+    /// [T2-4] Vision foreground-instance masks help on small objects and hurt
+    /// when the subject overflows the frame.
+    var usesForegroundMask: Bool {
+        switch self {
+        case .small:   return true
+        case .vehicle: return false
+        }
+    }
+
+    var guidanceCopy: String {
+        switch self {
+        case .small:
+            return "Orbit slowly at three heights — low, level, high — then a close-up pass filling the frame."
+        case .vehicle:
+            return "Walk a full lap at waist height, then a second lap at chest height aiming slightly down, then a third lap close in on the panels. Finish the lap — the app now saves budget for the far side."
+        }
+    }
+}
+
+/// Written into the frames folder so the sample loader knows how the capture
+/// was configured without threading state through the photogrammetry call.
+struct CaptureConfigSidecar: Codable {
+    var scale: String
+    var usesForegroundMask: Bool
+}
+
+// MARK: - Main view
+
 struct ObjectCaptureView: View {
     @AppStorage("renderBaseURL") private var renderBaseURL: String = ""
     @AppStorage("uploadToken") private var uploadToken: String = ""
     @AppStorage("slugPrefix") private var slugPrefix: String = "vista-"
+    @AppStorage("objectCaptureScale") private var scaleRaw: String = CaptureScale.small.rawValue
 
     @State private var phase: Phase = .idle
     @State private var showCaptureSheet = false
+
+    private var scale: CaptureScale {
+        CaptureScale(rawValue: scaleRaw) ?? .small
+    }
 
     enum Phase {
         case idle
@@ -76,11 +155,14 @@ struct ObjectCaptureView: View {
                     Text("Object Capture")
                         .font(.title)
                         .fontWeight(.semibold)
-                    Text("Aim at the object and tap Start. Orbit slowly at three heights — low, level, high — then a close-up pass filling the frame. Blurry shots are rejected automatically. 12 MP photos plus LiDAR depth and an automatic object mask feed on-device photogrammetry (~5–10 min). No box to place; isolation is automatic.")
+                    Text("Aim at the object and tap Start. \(scale.guidanceCopy) Blurry shots are rejected automatically. 12 MP photos plus LiDAR depth feed on-device photogrammetry (~5–10 min). No box to place; isolation is automatic.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 40)
+
+                    scalePicker
+
                     Divider().padding(.horizontal, 40)
                     if !isLidarSupported {
                         unsupportedNotice
@@ -94,6 +176,7 @@ struct ObjectCaptureView: View {
         }
         .fullScreenCover(isPresented: $showCaptureSheet) {
             ObjectCaptureSheet(
+                scale: scale,
                 onFinish: { framesFolder in
                     showCaptureSheet = false
                     Task { await runPhotogrammetry(framesFolder: framesFolder) }
@@ -101,6 +184,27 @@ struct ObjectCaptureView: View {
                 onCancel: { showCaptureSheet = false },
                 onError: handleScanError
             )
+        }
+    }
+
+    // [T2-3] Scale picker. The default stays .small so existing muscle memory
+    // and existing small-object results are untouched.
+    private var scalePicker: some View {
+        VStack(spacing: 6) {
+            Picker("Size", selection: Binding(
+                get: { scale },
+                set: { scaleRaw = $0.rawValue }
+            )) {
+                ForEach(CaptureScale.allCases) { s in
+                    Text(s.title).tag(s)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 40)
+
+            Text(scale.subtitle)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -144,7 +248,7 @@ struct ObjectCaptureView: View {
                 Text("\(stage) — \(Int(pct * 100))%")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Photogrammetry with depth + object masks: ~5–10 minutes. Keep the app open.")
+                Text("Photogrammetry with depth: ~5–10 minutes on a small object, longer on a vehicle. Keep the app open.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -221,7 +325,7 @@ struct ObjectCaptureView: View {
         phase = .failed(error.localizedDescription)
     }
 
-    // MARK: - Photogrammetry (samples input: depth + gravity + masks)
+    // MARK: - Photogrammetry (samples input: depth + gravity + optional masks)
 
     /// Runs photogrammetry over a LAZY sequence of enriched samples. iOS
     /// exposes only .preview/.reduced detail; the chain structure remains so
@@ -274,7 +378,9 @@ struct ObjectCaptureView: View {
         var config = PhotogrammetrySession.Configuration()
         config.sampleOrdering = .sequential       // we orbit; neighbors overlap
         config.featureSensitivity = .normal
-        config.isObjectMaskingEnabled = true      // use our masks + RealityKit's
+        // Masking stays enabled as a session capability; whether a per-sample
+        // mask is actually supplied is decided by the loader from the sidecar.
+        config.isObjectMaskingEnabled = loader.usesForegroundMask
 
         let pSession = try PhotogrammetrySession(input: samples, configuration: config)
         try pSession.process(requests: [.modelFile(url: tmpURL, detail: detail)])
@@ -332,11 +438,15 @@ struct ObjectCaptureView: View {
 /// Loads one enriched PhotogrammetrySample at a time from the capture folder.
 /// Per frame on disk: <base>.jpg (12 MP), <base>_depth.bin (Float32 LE),
 /// <base>_conf.bin (UInt8, saved for future cloud use), <base>_meta.json
-/// (gravity + depth dims). Every enrichment is optional — failures degrade
-/// the sample to image-only.
+/// (gravity + depth dims). Folder-level: capture_config.json. Every
+/// enrichment is optional — failures degrade the sample to image-only.
 final class ObjectSampleLoader {
     private let framesFolder: URL
     private let ciContext = CIContext()
+
+    /// [T2-4] Read once from capture_config.json. Defaults to true so a
+    /// folder written by an older build behaves exactly like v2.
+    let usesForegroundMask: Bool
 
     struct FrameMetaSidecar: Codable {
         var gravityX: Double?
@@ -348,6 +458,13 @@ final class ObjectSampleLoader {
 
     init(framesFolder: URL) {
         self.framesFolder = framesFolder
+        let cfgURL = framesFolder.appendingPathComponent("capture_config.json")
+        if let data = try? Data(contentsOf: cfgURL),
+           let cfg = try? JSONDecoder().decode(CaptureConfigSidecar.self, from: data) {
+            self.usesForegroundMask = cfg.usesForegroundMask
+        } else {
+            self.usesForegroundMask = true
+        }
     }
 
     /// Sorted base names (no extension) of all captured frames.
@@ -388,7 +505,8 @@ final class ObjectSampleLoader {
         }
 
         // Automatic object isolation: Vision foreground-instance mask.
-        if let mask = makeForegroundMask(jpgURL: jpgURL) {
+        // [T2-4] Skipped for vehicle-scale captures — see header.
+        if usesForegroundMask, let mask = makeForegroundMask(jpgURL: jpgURL) {
             sample.objectMask = mask
         }
 
@@ -486,6 +604,7 @@ final class ObjectSampleLoader {
 // MARK: - Fullscreen capture sheet (no box — aim, Start, orbit)
 
 private struct ObjectCaptureSheet: View {
+    let scale: CaptureScale
     let onFinish: (URL) -> Void
     let onCancel: () -> Void
     let onError: (Error) -> Void
@@ -495,18 +614,22 @@ private struct ObjectCaptureSheet: View {
     @State private var isFinishing = false
     @State private var isCapturing = false
     @State private var frameCount: Int = 0
-
-    /// [T1-1] Coverage target: three height orbits + one close-up orbit.
-    private let targetPhotos = 120
+    @State private var coverage: Float = 0      // [T2-5] fraction of 360 seen
+    @State private var budgetSpent: Bool = false
 
     var body: some View {
         ZStack {
             ObjectARRepresentable(
+                scale: scale,
                 onViewReady: { view, coord in
                     arViewRef = view
                     coordinatorRef = coord
                 },
-                onFrameCountUpdate: { fc in frameCount = fc }
+                onProgressUpdate: { fc, cov, spent in
+                    frameCount = fc
+                    coverage = cov
+                    budgetSpent = spent
+                }
             )
             .ignoresSafeArea()
 
@@ -526,6 +649,12 @@ private struct ObjectCaptureSheet: View {
 
                 Spacer()
 
+                if isCapturing && scale.usesSectorBudget {
+                    coverageBar
+                        .padding(.horizontal, 40)
+                        .padding(.bottom, 12)
+                }
+
                 primaryControls
                     .padding(.bottom, 32)
             }
@@ -541,10 +670,9 @@ private struct ObjectCaptureSheet: View {
             }
             .foregroundStyle(.white)
             .padding(.horizontal, 12).padding(.vertical, 6)
-            .background(frameCount >= targetPhotos ? .green.opacity(0.7) : .black.opacity(0.5),
-                        in: Capsule())
+            .background(badgeColor, in: Capsule())
         } else {
-            Text("Aim at the object, then Start")
+            Text("Aim at the \(scale == .vehicle ? "vehicle" : "object"), then Start")
                 .font(.caption.monospaced())
                 .foregroundStyle(.white)
                 .padding(.horizontal, 12).padding(.vertical, 6)
@@ -552,13 +680,44 @@ private struct ObjectCaptureSheet: View {
         }
     }
 
+    private var badgeColor: Color {
+        if budgetSpent { return .orange.opacity(0.8) }
+        if coverage >= 0.95 { return .green.opacity(0.7) }
+        return .black.opacity(0.5)
+    }
+
+    /// [T2-5] A real coverage read-out. The old version guessed progress from
+    /// the photo count, which is exactly the assumption that hid the bug.
+    private var coverageBar: some View {
+        VStack(spacing: 4) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.white.opacity(0.25))
+                    Capsule().fill(coverage >= 0.95 ? Color.green : Color.blue)
+                        .frame(width: geo.size.width * CGFloat(coverage))
+                }
+            }
+            .frame(height: 6)
+            Text("\(Int(coverage * 100))% of the way around")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.white.opacity(0.9))
+        }
+    }
+
     private var guidanceText: String {
-        switch frameCount {
-        case 0..<30:    return "orbit low — full circle"
-        case 30..<60:   return "orbit at eye level"
-        case 60..<90:   return "orbit high, aim down"
-        case 90..<120:  return "get CLOSE — fill the frame, orbit once"
-        default:        return "great coverage — tap Done"
+        if budgetSpent { return "photo budget full — tap Done" }
+        switch scale {
+        case .vehicle:
+            if coverage < 0.95 { return "keep walking the lap" }
+            return "lap done — go again, higher / closer"
+        case .small:
+            switch frameCount {
+            case 0..<30:    return "orbit low — full circle"
+            case 30..<60:   return "orbit at eye level"
+            case 60..<90:   return "orbit high, aim down"
+            case 90..<120:  return "get CLOSE — fill the frame, orbit once"
+            default:        return "great coverage — tap Done"
+            }
         }
     }
 
@@ -601,11 +760,12 @@ private struct ObjectCaptureSheet: View {
 // MARK: - UIViewRepresentable
 
 private struct ObjectARRepresentable: UIViewRepresentable {
+    let scale: CaptureScale
     let onViewReady: (ARView, ObjectFrameCoordinator) -> Void
-    let onFrameCountUpdate: (Int) -> Void
+    let onProgressUpdate: (Int, Float, Bool) -> Void
 
     func makeCoordinator() -> ObjectFrameCoordinator {
-        ObjectFrameCoordinator(onFrameCountUpdate: onFrameCountUpdate)
+        ObjectFrameCoordinator(scale: scale, onProgressUpdate: onProgressUpdate)
     }
 
     func makeUIView(context: Context) -> ARView {
@@ -643,10 +803,12 @@ private struct ObjectARRepresentable: UIViewRepresentable {
 // MARK: - Coordinator (capture only — no box, no gestures)
 
 final class ObjectFrameCoordinator: NSObject, ARSessionDelegate {
-    let onFrameCountUpdate: (Int) -> Void
+    let onProgressUpdate: (Int, Float, Bool) -> Void
 
     let framesFolder: URL
     private(set) var frameCount = 0
+
+    private let scale: CaptureScale
 
     private var lastCapturedTransform: simd_float4x4?
     private let ciContext = CIContext()
@@ -656,12 +818,23 @@ final class ObjectFrameCoordinator: NSObject, ARSessionDelegate {
     private var captureStarted = false
     private var frameIndex = 0
 
-    // [T1-1] Orbit-tuned cadence, tightened for the 120-photo target: the
-    // rotation gate (~6 deg) fires through orbits, the translation gate
-    // (~9 cm) covers height changes and the close-up pass.
-    private let translationThresholdMeters: Float = 0.09
-    private let rotationThresholdRadians: Float = 0.10
-    private let maxPhotos = 250
+    // Cadence gates (per scale). The rotation gate fires through orbits, the
+    // translation gate covers height changes and the close-up pass.
+    private let translationThresholdMeters: Float
+    private let rotationThresholdRadians: Float
+    private let maxPhotos: Int
+
+    // [T2-1] Sector budget. 24 sectors of 15 deg of bearing around the object
+    // center. Each sector may contribute at most `perSectorQuota` photos, so
+    // the first side you walk cannot spend the whole budget.
+    private static let sectorCount = 24
+    private var sectorCounts = [Int](repeating: 0, count: ObjectFrameCoordinator.sectorCount)
+    private let perSectorQuota: Int
+    private let usesSectorBudget: Bool
+
+    // [T2-2] Object center, estimated once at Start from LiDAR depth.
+    private var objectCenter: SIMD3<Float>?
+    private var centerAttempts = 0
 
     // [T1-3] Blur gate state: running best sharpness; frames scoring below
     // 30% of the best (after warmup) are rejected and recaptured.
@@ -669,14 +842,32 @@ final class ObjectFrameCoordinator: NSObject, ARSessionDelegate {
 
     private let motion = CMMotionManager()
 
-    init(onFrameCountUpdate: @escaping (Int) -> Void) {
-        self.onFrameCountUpdate = onFrameCountUpdate
+    init(scale: CaptureScale,
+         onProgressUpdate: @escaping (Int, Float, Bool) -> Void) {
+        self.scale = scale
+        self.onProgressUpdate = onProgressUpdate
+        self.translationThresholdMeters = scale.translationThresholdMeters
+        self.rotationThresholdRadians = scale.rotationThresholdRadians
+        self.maxPhotos = scale.maxPhotos
+        self.usesSectorBudget = scale.usesSectorBudget
+        // Ceiling-divide so the quotas can actually reach the cap.
+        self.perSectorQuota = max(1, Int(ceil(Double(scale.maxPhotos)
+                                              / Double(ObjectFrameCoordinator.sectorCount))))
         self.framesFolder = FileManager.default.temporaryDirectory
             .appendingPathComponent("vista_obj_frames_\(Int(Date().timeIntervalSince1970))",
                                     isDirectory: true)
         try? FileManager.default.createDirectory(at: framesFolder,
                                                  withIntermediateDirectories: true)
         super.init()
+        writeCaptureConfig()
+    }
+
+    private func writeCaptureConfig() {
+        let cfg = CaptureConfigSidecar(scale: scale.rawValue,
+                                       usesForegroundMask: scale.usesForegroundMask)
+        if let data = try? JSONEncoder().encode(cfg) {
+            try? data.write(to: framesFolder.appendingPathComponent("capture_config.json"))
+        }
     }
 
     func beginCapture() {
@@ -692,10 +883,34 @@ final class ObjectFrameCoordinator: NSObject, ARSessionDelegate {
         motion.stopDeviceMotionUpdates()
     }
 
+    /// Fraction of the 360 that has at least one photo in it.
+    private var coverageFraction: Float {
+        guard usesSectorBudget else { return 0 }
+        let hit = sectorCounts.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
+        return Float(hit) / Float(Self.sectorCount)
+    }
+
+    private var budgetSpent: Bool {
+        frameCount >= maxPhotos
+    }
+
+    private func publishProgress() {
+        let fc = frameCount
+        let cov = coverageFraction
+        let spent = budgetSpent
+        DispatchQueue.main.async { self.onProgressUpdate(fc, cov, spent) }
+    }
+
     // MARK: AR session delegate
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard captureStarted, frameCount < maxPhotos else { return }
+
+        // [T2-2] Estimate the object center once, from the first few frames.
+        if usesSectorBudget, objectCenter == nil, centerAttempts < 30 {
+            centerAttempts += 1
+            objectCenter = Self.estimateObjectCenter(frame: frame)
+        }
 
         let camTransform = frame.camera.transform
         let shouldCapture: Bool
@@ -709,6 +924,21 @@ final class ObjectFrameCoordinator: NSObject, ARSessionDelegate {
         }
 
         guard shouldCapture && !saveInFlight else { return }
+
+        // [T2-1] Sector budget check. If this bearing is already full, skip
+        // the photo but DO advance lastCapturedTransform so we re-evaluate
+        // after the next step rather than firing every frame.
+        var sectorIndex: Int? = nil
+        if usesSectorBudget, let center = objectCenter {
+            let idx = Self.sectorIndex(cameraTransform: camTransform, center: center)
+            if sectorCounts[idx] >= perSectorQuota {
+                lastCapturedTransform = camTransform
+                publishProgress()
+                return
+            }
+            sectorIndex = idx
+        }
+
         saveInFlight = true
         lastCapturedTransform = camTransform
 
@@ -785,10 +1015,65 @@ final class ObjectFrameCoordinator: NSObject, ARSessionDelegate {
 
                 DispatchQueue.main.async {
                     self.frameCount += 1
-                    self.onFrameCountUpdate(self.frameCount)
+                    if let s = sectorIndex { self.sectorCounts[s] += 1 }
+                    self.publishProgress()
                 }
             }
         }
+    }
+
+    // MARK: [T2-2] object center + [T2-1] bearing sectors
+
+    /// Median of the valid central LiDAR depths, projected along the camera
+    /// forward axis. Rough on purpose — it only has to be good enough to make
+    /// bearing sectors meaningful, and a car-sized object tolerates ~0.5 m of
+    /// center error at 24 sectors. Returns nil when depth is unavailable, in
+    /// which case the sector budget stays off and v2 cadence applies.
+    static func estimateObjectCenter(frame: ARFrame) -> SIMD3<Float>? {
+        guard let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+        let buf = sceneDepth.depthMap
+        CVPixelBufferLockBaseAddress(buf, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
+        let w = CVPixelBufferGetWidth(buf)
+        let h = CVPixelBufferGetHeight(buf)
+        guard w > 8, h > 8, let base = CVPixelBufferGetBaseAddress(buf) else { return nil }
+        let rowBytes = CVPixelBufferGetBytesPerRow(buf)
+
+        // Central third of the depth map.
+        let x0 = w / 3, x1 = 2 * w / 3
+        let y0 = h / 3, y1 = 2 * h / 3
+        var samples: [Float] = []
+        samples.reserveCapacity((x1 - x0) * (y1 - y0))
+        for y in y0..<y1 {
+            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: Float32.self)
+            for x in x0..<x1 {
+                let d = row[x]
+                if d.isFinite, d > 0.15, d < 8.0 { samples.append(d) }
+            }
+        }
+        guard samples.count > 32 else { return nil }
+        samples.sort()
+        let median = samples[samples.count / 2]
+
+        let t = frame.camera.transform
+        let camPos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+        // ARKit camera looks down -Z.
+        let forward = -SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
+        return camPos + forward * median
+    }
+
+    /// Which 15-degree bearing sector the camera currently occupies, measured
+    /// around the object center in the horizontal plane.
+    static func sectorIndex(cameraTransform: simd_float4x4, center: SIMD3<Float>) -> Int {
+        let p = SIMD3<Float>(cameraTransform.columns.3.x,
+                             cameraTransform.columns.3.y,
+                             cameraTransform.columns.3.z)
+        let dx = p.x - center.x
+        let dz = p.z - center.z
+        var ang = atan2(dz, dx)                    // -pi ... pi
+        if ang < 0 { ang += 2 * Float.pi }         // 0 ... 2pi
+        let idx = Int(ang / (2 * Float.pi) * Float(sectorCount))
+        return min(max(idx, 0), sectorCount - 1)
     }
 
     // MARK: [T1-3] sharpness scoring
