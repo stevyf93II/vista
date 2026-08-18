@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Vista Viewer</title>
+<style>
+  html,body{margin:0;height:100%;background:#1b1d22;overflow:hidden;
+            font:14px/1.4 -apple-system,system-ui,sans-serif;color:#ddd;
+            -webkit-user-select:none;user-select:none;touch-action:none}
+  #c{display:block;width:100vw;height:100vh}
+  /* status banner: visible until a model loads, then hides. Also our error UI. */
+  #status{position:fixed;top:0;left:0;right:0;padding:10px 14px;
+          background:rgba(0,0,0,.6);color:#cfe;font-size:13px;text-align:center;
+          z-index:10}
+  #status.err{background:rgba(120,20,20,.85);color:#fff}
+  #status.hide{display:none}
+  #bar{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);
+       display:flex;gap:8px;z-index:10}
+  #bar button{background:#2b2f37;color:#eee;border:1px solid #444;border-radius:8px;
+              padding:9px 14px;font:14px system-ui;-webkit-tap-highlight-color:transparent}
+  #bar button:active{background:#3a3f49}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status">starting…</div>
+<div id="bar">
+  <button id="reset">Reset</button>
+  <button id="walls">Walls: see-through</button>
+  <button id="cut">Cutaway: off</button>
+</div>
+
+<!-- Status helper defined FIRST so any later failure is visible on screen. -->
+<script>
+  window.__status = function (msg, isErr) {
+    var el = document.getElementById('status');
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.toggle('err', !!isErr);
+    el.classList.remove('hide');
+  };
+  window.onerror = function (m, src, line) {
+    window.__status('JS error: ' + m + ' (line ' + line + ')', true);
+    return false;
+  };
+  window.__status('loading 3D engine…');
+</script>
+
+<!-- Classic (non-module) three.js r128 — no ES modules, no import maps; that's
+     what loads reliably inside a file:// WKWebView. Each library is tried from
+     the APP BUNDLE first (works offline once three.min.js / OrbitControls.js /
+     GLTFLoader.js are added to Copy Bundle Resources), then falls back to the
+     CDN. Sequential because each depends on the previous. -->
+<script>
+(function () {
+  var LIBS = [
+    { local: 'three.min.js',
+      cdn: 'https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js',
+      name: 'three.js core' },
+    { local: 'OrbitControls.js',
+      cdn: 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js',
+      name: 'OrbitControls' },
+    { local: 'GLTFLoader.js',
+      cdn: 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js',
+      name: 'GLTFLoader' }
+  ];
+  var i = 0;
+  function next(failedName) {
+    if (failedName) {
+      window.__status('Failed to load ' + failedName +
+                      ' — not bundled and no connection', true);
+      return;
+    }
+    if (i >= LIBS.length) {
+      if (window.__vistaInit) window.__vistaInit();
+      else window.__status('viewer init missing', true);
+      return;
+    }
+    var lib = LIBS[i++];
+    function attempt(src, isFallback) {
+      var s = document.createElement('script');
+      s.src = src;
+      s.onload = function () { next(null); };
+      s.onerror = function () {
+        if (!isFallback) attempt(lib.cdn, true);
+        else next(lib.name);
+      };
+      document.head.appendChild(s);
+    }
+    attempt(lib.local, false);
+  }
+  window.__vistaLoadLibs = next;
+})();
+</script>
+
+<script>
+window.__vistaInit = function () {
+  if (typeof THREE === 'undefined') {
+    window.__status('3D engine did not load — check connection', true);
+    return;
+  }
+  window.__status('engine ready — waiting for model…');
+
+  var canvas = document.getElementById('c');
+  var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.outputEncoding = THREE.sRGBEncoding;   // r128 color management
+  renderer.localClippingEnabled = true;           // cutaway clip plane
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1b1d22);
+  var camera = new THREE.PerspectiveCamera(55, 1, 0.01, 1000);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.15));
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  var d1 = new THREE.DirectionalLight(0xffffff, 0.7); d1.position.set(1, 2, 1); scene.add(d1);
+  var d2 = new THREE.DirectionalLight(0xffffff, 0.4); d2.position.set(-1, 1, -1); scene.add(d2);
+
+  var controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.screenSpacePanning = true;
+
+  // Backface culling ON by default = dollhouse view (near walls culled, far
+  // walls visible). Respects the GLB's single-sided materials + TSDF inward
+  // normals. The Walls button toggles to solid (double-sided).
+  var model = null, homeFit = null, doubleSided = false;
+  // Cutaway: clips to within 0.8m of the focus point (floor 25% of camera
+  // distance) — slices interior furniture, not just already-culled walls.
+  var cutaway = false;
+  var cutPlane = new THREE.Plane(new THREE.Vector3(0, 0, -1), 1e9);
+
+  function frameModel(obj) {
+    var box = new THREE.Box3().setFromObject(obj);
+    var size = box.getSize(new THREE.Vector3());
+    var center = box.getCenter(new THREE.Vector3());
+    var radius = 0.5 * size.length();
+    var dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov * 0.5));
+    controls.target.copy(center);
+    camera.position.copy(center).add(new THREE.Vector3(0.6, 0.5, 1).normalize().multiplyScalar(dist * 1.1));
+    camera.near = Math.max(radius / 1000, 0.005);
+    camera.far = radius * 100;
+    camera.updateProjectionMatrix();
+    controls.update();
+    return { pos: camera.position.clone(), target: center.clone(), near: camera.near, far: camera.far };
+  }
+
+  function applySides() {
+    if (!model) return;
+    model.traverse(function (o) {
+      if (!o.isMesh) return;
+      var mats = Array.isArray(o.material) ? o.material : [o.material];
+      mats.forEach(function (m) {
+        m.side = doubleSided ? THREE.DoubleSide : THREE.FrontSide;
+        m.clippingPlanes = cutaway ? [cutPlane] : null;
+        m.needsUpdate = true;
+      });
+    });
+  }
+
+  function loadArrayBuffer(buf, name) {
+    window.__status('parsing model…');
+    try {
+      new THREE.GLTFLoader().parse(buf, '', function (gltf) {
+        if (model) scene.remove(model);
+        model = gltf.scene;
+        var meshes = 0;
+        model.traverse(function (o) {
+          if (o.isMesh) {
+            meshes++;
+            if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+          }
+        });
+        scene.add(model);
+        applySides();
+        homeFit = frameModel(model);
+        if (meshes > 0) {
+          document.getElementById('status').classList.add('hide');   // success: hide banner
+        } else {
+          window.__status('model loaded but has no meshes', true);
+        }
+      }, function (err) {
+        window.__status('GLTF parse failed: ' + err, true);
+      });
+    } catch (e) {
+      window.__status('parse threw: ' + e, true);
+    }
+  }
+
+  // Native bridge: iOS pushes the baked GLB as base64 once we signal ready.
+  window.loadBase64GLB = function (b64, name) {
+    try {
+      window.__status('decoding model (' + Math.round(b64.length / 1024) + ' KB)…');
+      var bin = atob(b64), len = bin.length, bytes = new Uint8Array(len);
+      for (var i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+      loadArrayBuffer(bytes.buffer, name || 'room.glb');
+    } catch (e) {
+      window.__status('decode failed: ' + e, true);
+    }
+  };
+
+  document.getElementById('reset').onclick = function () {
+    if (!homeFit) return;
+    camera.position.copy(homeFit.pos); controls.target.copy(homeFit.target);
+    camera.near = homeFit.near; camera.far = homeFit.far;
+    camera.updateProjectionMatrix(); controls.update();
+  };
+  document.getElementById('walls').onclick = function () {
+    doubleSided = !doubleSided; applySides();
+    this.textContent = doubleSided ? 'Walls: solid' : 'Walls: see-through';
+  };
+  document.getElementById('cut').onclick = function () {
+    cutaway = !cutaway; applySides();
+    this.textContent = cutaway ? 'Cutaway: on' : 'Cutaway: off';
+  };
+
+  function resize() {
+    var w = window.innerWidth, h = window.innerHeight;
+    renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize); resize();
+  (function loop() {
+    requestAnimationFrame(loop);
+    controls.update();
+    if (cutaway) {
+      var dir = new THREE.Vector3();
+      camera.getWorldDirection(dir);
+      var d = camera.position.distanceTo(controls.target);
+      var cutDist = Math.max(d - 0.8, d * 0.25);
+      cutPlane.normal.copy(dir);
+      cutPlane.constant = -(dir.dot(camera.position) + cutDist);
+    }
+    renderer.render(scene, camera);
+  })();
+
+  // Tell the native host we're ready for the GLB.
+  function ping() {
+    try {
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.glbReady) {
+        window.webkit.messageHandlers.glbReady.postMessage('ready');
+      }
+    } catch (e) { /* not in WKWebView */ }
+  }
+  ping();
+};
+</script>
+
+<script>
+  // Kick off library loading (local-first, CDN fallback) → __vistaInit().
+  window.__vistaLoadLibs();
+</script>
+</body>
+</html>
